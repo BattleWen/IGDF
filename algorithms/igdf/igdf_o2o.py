@@ -22,7 +22,7 @@ from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from env.common import call_env
 
-from discriminator import DeltaCla
+from contrastiveoi import ContrastiveInfo
 
 TensorBatch = List[torch.Tensor]
 
@@ -36,7 +36,7 @@ LOG_STD_MAX = 2.0
 class TrainConfig:
     # Wandb logging
     project: str = "H2O"
-    group: str = "O2O-h2o"
+    group: str = "O2O-igdf"
     name: str = "IQL"
 
     # Experiment
@@ -66,17 +66,26 @@ class TrainConfig:
     actor_lr: float = 3e-4  # Actor learning rate
     actor_dropout: Optional[float] = None  # Adroit uses dropout for policy network
     
-    # discriminator
-    disc_lr: float = 3e-4
-    disc_hidden_size: int = 256
-    disc_batch_size: int = 128
+    # Info
+    repr_dim: int = 64
+    ensemble_size: int = 1
+    info_lr: float = 3e-4
+    info_batch_size: int = 128
+    num_update: int = 7000
+    repr_norm: bool = False
+    repr_norm_temp: bool = False
+    ortho_init: bool = False
+    output_gain: Optional[float] = None
+    percent: float = 0.5
+    alpha: float = 1.0
 
     # start using source data
     start_using_source: int = 1e5
-    disc_train_freq: int = 10
+    disc_train_freq: int = 100
+    disc_batch_size: int = 128
 
     def __post_init__(self):
-        self.name = f"{self.name}-{str(uuid.uuid4())[:8]}-{self.seed}"
+        self.name = f"{self.name}-{str(uuid.uuid4())[:8]}-{self.seed}-{self.percent}-{self.alpha}"
         self.group = f"{self.group}-{self.env}-{self.env_name}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
@@ -85,12 +94,6 @@ class TrainConfig:
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
-
-
-# def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-#     mean = states.mean(0)
-#     std = states.std(0) + eps
-#     return mean, std
 
 
 def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
@@ -631,21 +634,6 @@ def get_target_data2(data_path):
         'terminals': np.concatenate((done_[:N],done_[-N:])),
     }
 
-# def merge_data(source_data, target_data):
-#     merged_states  = np.concatenate((source_data['observations'], target_data['observations']), axis = 0)
-#     merged_actions = np.concatenate((source_data['actions'], target_data['actions']), axis = 0)
-#     merged_rewards = np.concatenate((source_data['next_observations'], target_data['next_observations']), axis = 0)
-#     merged_next_states = np.concatenate((source_data['rewards'], target_data['rewards']), axis = 0)
-#     source_data['terminals'] = np.squeeze(source_data['terminals'])
-#     merged_dones = np.concatenate((source_data['terminals'], target_data['terminals']), axis = 0)
-
-#     return {
-#         'observations': merged_states,
-#         'actions': merged_actions,
-#         'next_observations': merged_rewards,
-#         'rewards': merged_next_states,
-#         'terminals': merged_dones,
-#     }
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
@@ -694,15 +682,19 @@ def train(config: TrainConfig):
         )
     target_buffer.load_d4rl_dataset(target_data)
 
-    # Discriminator
-    discriminator = DeltaCla(
-        state_dim= state_dim,
-        action_dim= action_dim,
-        device= config.device,
-        hidden_size= config.disc_hidden_size,
-        lr= config.disc_lr
-    )
-    disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=config.disc_lr)
+    # info
+    info = ContrastiveInfo(
+        state_dim,
+        action_dim,
+        config.repr_dim,
+        config.ensemble_size,
+        config.repr_norm,
+        config.repr_norm_temp,
+        config.ortho_init,
+        config.output_gain,
+    ).to(config.device)
+
+    info_optimizer = torch.optim.Adam(info.parameters(), lr=config.info_lr)
 
     # IQL 
     max_action = float(env.action_space.high[0])
@@ -774,30 +766,77 @@ def train(config: TrainConfig):
             online_s = env.reset()
         else:
             online_s = online_next_s
-        # train discriminator
+        # train representation
         if total_steps % config.disc_train_freq == 0 and source_buffer._size > config.disc_batch_size:
-            loss_disc, loss_sas_disc, loss_sa_disc = discriminator.update_param_cla(source_buffer, target_buffer, config.disc_batch_size)
-            disc_optimizer.zero_grad()
-            loss_disc.backward()
-            disc_optimizer.step()
-            wandb.log(
-                {"disc_loss": loss_disc.item(),
-                 "disc_loss_sas": loss_sas_disc.item(),
-                 "disc_loss_sa": loss_sa_disc.item(),
-                },
-                step = total_steps
-            )
+            tar_s, tar_a, _, tar_ss, _ = target_buffer.sample(config.info_batch_size) 
+            _, _, _, src_ss, _ = source_buffer.sample(config.info_batch_size - 1)
+            tar_s = tar_s.unsqueeze(1) # [128, 1, state_dim]
+            tar_a = tar_a.unsqueeze(1) # [128, 1, action_dim]
+            tar_ss = tar_ss.unsqueeze(1) # [128, 1, state_dim]
+            src_ss = src_ss.unsqueeze(0) # [1, 127, state_dim]
+            src_ss = src_ss.expand(config.info_batch_size, -1, -1) # [128, 127, state_dim]
+            ss = torch.concat((tar_ss, src_ss), dim = 1) # [128, 128, state_dim]
+
+            logits = info(tar_s, tar_a, ss) # [128, 1, 128]
+            logits = logits.squeeze(1)
+            matrix = torch.zeros((config.info_batch_size, config.info_batch_size), dtype = torch.float32, device = config.device)
+            matrix[:, 0] = 1
+            # correct = (torch.argmax(logits, dim=1) == torch.argmax(matrix, dim=1))
+            # binary_accuracy      = torch.mean(((logits > 0) == matrix).type(torch.float32)).item()
+            # categorical_accuracy = torch.mean((correct).type(torch.float32)).item()
+            info_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, matrix)
+            info_loss = torch.mean(info_loss)
+            info_optimizer.zero_grad()
+            info_loss.backward()
+            info_optimizer.step()
+
+            total_steps += 1
+            # wandb.log(
+            #     {"info_loss": info_loss,
+            #     #  "binary_accuracy": binary_accuracy,
+            #     #  "categorical_accuracy": categorical_accuracy,
+            #     },
+            #     step = total_steps
+            # )
         # train iql
         target_batch                        = target_buffer.sample(config.batch_size // 2)
         if total_steps > config.start_using_source:
             src_s, src_a, src_r, src_ss, done   = source_buffer.sample(config.batch_size // 2)
-            # weight and mask cal
-            h2o_weight                          = discriminator.delta_weight(src_s, src_a, src_ss)
-            mask                        = torch.ones((config.batch_size, 1)).to(config.device)
-            mask[:config.batch_size // 2]    = h2o_weight.unsqueeze(1)
-            # merge data
-            source_batch    = [src_s, src_a, src_r, src_ss, done]
-            batch           = merge_batch(source_batch, target_batch)
+            logits, srcsa_repr, srcss_repr = info(src_s, src_a, src_ss, return_repr = True)
+            srcsa_repr = torch.linalg.norm(srcsa_repr, dim=-1, keepdim=True)  # [128, 1]
+            srcss_repr = torch.linalg.norm(srcss_repr, dim=-1, keepdim=True)  # [128, 1]
+            diagonal_elements = torch.diag(logits).reshape(-1, 1)
+            src_info = diagonal_elements / (srcsa_repr * srcss_repr) # [128, 1]
+            sorted_indices = torch.argsort(src_info[:, 0])
+            if config.percent == 0.25:
+                sorted_num = -32
+            if config.percent == 0.5:
+                sorted_num = -64
+            if config.percent == 0.75:
+                sorted_num = -96
+            if config.percent == 1.0:
+                sorted_num = -128
+            top_half_indices = sorted_indices[sorted_num:]
+            src_s = src_s[top_half_indices]
+            src_a = src_a[top_half_indices]
+            src_ss = src_ss[top_half_indices]
+            src_r = src_r[top_half_indices]
+            done = done[top_half_indices]
+            info_temp = torch.exp(src_info[top_half_indices] * config.alpha)
+            if config.percent == 0.25:
+                mask = torch.ones((128+32, 1)).to(config.device)
+                mask[:32] = info_temp
+            if config.percent == 0.5:
+                mask = torch.ones((128+64, 1)).to(config.device)
+                mask[:64] = info_temp
+            if config.percent == 0.75:
+                mask = torch.ones((128+96, 1)).to(config.device)
+                mask[:96] = info_temp
+            if config.percent == 1.0:
+                mask = torch.ones((128+128, 1)).to(config.device)
+                mask[:128] = info_temp
+            source_batch = [src_s, src_a, src_r, src_ss, done]
+            batch = merge_batch(source_batch, target_batch)
         else:
             batch = target_batch
             mask  = torch.ones((config.batch_size, 1)).to(config.device)
