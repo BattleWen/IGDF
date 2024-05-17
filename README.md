@@ -30,5 +30,17 @@ python igdf.py --seed 12 --env halfcheetah-medium-v2 --env_num 41 --xi 0.25 --al
 ```
 
 ## Notice
-1. For the *HalfCheetah-v2* and *Hopper-v2* environments are more suitable for smaller sampling ratios ($\xi = 25\%$)
-2. For the *Walker2d-v2* environment is more suitable for a relatively large sampling ratio ($\xi = 75\%$).
+1. For the *HalfCheetah-v2* and *Hopper-v2* environments are more suitable for smaller sampling ratios ($\xi% = 25\%)
+2. For the *Walker2d-v2* environment is more suitable for a relatively large sampling ratio ($\xi% = 75\%).
+
+## References
+```bib
+@inproceedings{
+anonymous2024contrastive,
+title={Contrastive Representation for Data Filtering in Cross-Domain Offline Reinforcement Learning},
+author={Anonymous},
+booktitle={Forty-first International Conference on Machine Learning},
+year={2024},
+url={https://openreview.net/forum?id=rReWhol66R}
+}
+```
