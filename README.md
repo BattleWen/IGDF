@@ -36,9 +36,9 @@ python igdf.py --seed 12 --env halfcheetah-medium-v2 --env_num 41 --xi 0.25 --al
 ## References
 ```bib
 @inproceedings{
-anonymous2024contrastive,
+wen2024contrastive,
 title={Contrastive Representation for Data Filtering in Cross-Domain Offline Reinforcement Learning},
-author={Anonymous},
+author={Xiaoyu Wen, Chenjia Bai, Kang Xu, Xudong Yu, Yang Zhang, Xuelong Li, Zhen Wang},
 booktitle={Forty-first International Conference on Machine Learning},
 year={2024},
 url={https://openreview.net/forum?id=rReWhol66R}
