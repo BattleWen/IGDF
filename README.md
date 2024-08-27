@@ -1,5 +1,5 @@
 # Contrastive Representation for Data Filtering in Cross-Domain Offline Reinforcement Learning
-
+Code for the ICML 2024 paper "Contrastive Representation for Data Filtering in Cross-Domain Offline Reinforcement Learning". 
 ![](fig/method.jpg)
 
 ## Tasks and Datasets
